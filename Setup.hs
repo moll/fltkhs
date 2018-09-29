@@ -32,8 +32,6 @@ import Distribution.Simple.BuildPaths
 import System.Directory(getCurrentDirectory, copyFile, createDirectoryIfMissing, listDirectory, withCurrentDirectory, doesDirectoryExist, makeAbsolute, doesFileExist)
 import System.FilePath ( (</>), (<.>), takeExtension, combine, takeBaseName, takeDirectory)
 import qualified Distribution.Simple.GHC  as GHC
-import qualified Distribution.Simple.JHC  as JHC
-import qualified Distribution.Simple.LHC  as LHC
 import qualified Distribution.Simple.UHC  as UHC
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.PackageDescription as PD
@@ -65,6 +63,7 @@ _registerPackage verbosity lbi packageDbs installedPkgInfo
 
 main :: IO ()
 main = defaultMainWithHooks autoconfUserHooks {
+  preRepl = myPreRepl,
   preConf = myPreConf,
   postConf = myPostConf,
   buildHook = myBuildHook,
@@ -118,6 +117,12 @@ buildFltk prefix openGL = do
           rawSystemExit normal (fltkDir </> "configure") fltkFlags
           make
     )
+
+myPreRepl :: Args -> ReplFlags -> IO HookedBuildInfo
+myPreRepl args replFlags = do
+  hbi <- (preRepl autoconfUserHooks) args replFlags
+  putStrLn (show hbi)
+  return hbi
 
 myPreConf :: Args -> ConfigFlags -> IO HookedBuildInfo
 myPreConf args flags = do

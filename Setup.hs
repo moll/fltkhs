@@ -20,6 +20,7 @@ import Distribution.Simple.Program
    , happyProgram, alexProgram, ghcProgram, gccProgram, requireProgram, arProgram)
 import Distribution.Simple.Program.Db
 import Distribution.Simple.PreProcess
+import Distribution.Simple.Configure (findDistPrefOrDefault) 
 import Distribution.Simple.Register ( generateRegistrationInfo, registerPackage )
 import qualified Distribution.Simple.Register as Register
 import Distribution.Simple.InstallDirs (fromPathTemplate)
@@ -28,11 +29,9 @@ import System.IO.Error
 import qualified Distribution.Simple.Program.Ar    as Ar
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.Simple.BuildPaths
-import System.Directory(getCurrentDirectory, getDirectoryContents, withCurrentDirectory, doesDirectoryExist, makeAbsolute, doesFileExist)
+import System.Directory(getCurrentDirectory, copyFile, listDirectory, createDirectoryIfMissing, withCurrentDirectory, doesDirectoryExist, makeAbsolute, doesFileExist)
 import System.FilePath ( (</>), (<.>), takeExtension, combine, takeBaseName, takeDirectory)
 import qualified Distribution.Simple.GHC  as GHC
-import qualified Distribution.Simple.JHC  as JHC
-import qualified Distribution.Simple.LHC  as LHC
 import qualified Distribution.Simple.UHC  as UHC
 import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.PackageDescription as PD
@@ -46,9 +45,9 @@ import System.Environment (getEnv, setEnv)
 
 -- cabal >=2.0.0.2
 #if defined(MIN_VERSION_Cabal) && MIN_VERSION_Cabal(2,0,0)
-_FlagName = mkFlagName 
+_FlagName = mkFlagName
 #else
-_FlagName = FlagName 
+_FlagName = FlagName
 #endif
 
 -- cabal >=2.0.1.1
@@ -74,9 +73,9 @@ main = defaultMainWithHooks autoconfUserHooks {
 
 fltkSource = "fltk-1.3.4-1"
 
-runMake :: [String] -> IO ()
-runMake args =
-  case buildOS of
+runMake :: FilePath -> [String] -> IO ()
+runMake dir args = do
+  withCurrentDirectory dir $ case buildOS of
     Windows -> rawSystemExit normal "make" args
     os | os `elem` [FreeBSD, OpenBSD, NetBSD, DragonFly]
       -> rawSystemExit normal "gmake" args
@@ -99,7 +98,7 @@ buildFltk prefix openGL = do
   withCurrentDirectory
     fltkDir
     (
-      let make = runMake [] >> runMake ["install"]
+      let make = runMake fltkDir [] >> runMake fltkDir ["install"]
       in
       case buildOS of
         Windows -> do
@@ -155,12 +154,21 @@ myPostConf args flags pd lbi = do
                    ("--with-fltk-patch-version=" ++ patch)
                  ]
         }
-  postConf autoconfUserHooks args confFlagsWithVersion (addApiVersion pd apiVersion) lbi
 
-fltkcdir :: FilePath
-fltkcdir = unsafePerformIO $ do
-  d <- getCurrentDirectory
-  return (d </> "c-lib")
+  let
+      baseDir lbi' =
+        case (cabalFilePath lbi') of
+          Nothing -> ""
+          Just p -> takeDirectory p
+      basedir = baseDir lbi
+      csrc = basedir </> "c-src"
+
+  distBuild <- fmap (\d -> d </> "build") (findDistPrefOrDefault (configDistPref flags))
+  srcFiles <- listDirectory csrc
+  createDirectoryIfMissing False (distBuild </> "c-src")
+  mapM_ (\f -> copyFile (csrc </> f) (distBuild </> "c-src" </> f)) srcFiles
+  postConf autoconfUserHooks args confFlagsWithVersion pd lbi 
+
 fltkclib = "fltkc"
 
 getFltkVersion :: IO (String, String, String)
@@ -178,15 +186,15 @@ fltkVersion version =
   in (major, minor, patch)
 
 flagIsSet :: PD.FlagName -> ConfigFlags -> Bool
-flagIsSet flag configFlags = maybe False id (lookup flag (configConfigurationsFlags configFlags))
+flagIsSet flag configFlags = maybe False id (PD.lookupFlagAssignment flag (configConfigurationsFlags configFlags))
 
-addFltkcDir :: PackageDescription -> PackageDescription
-addFltkcDir pkg_descr =
+addFltkcDir :: FilePath -> PackageDescription -> PackageDescription
+addFltkcDir dir pkg_descr =
   pkg_descr {
      library = fmap (\l' -> l' {
                               libBuildInfo =
                                  (libBuildInfo l') {
-                                    extraLibDirs = (extraLibDirs (libBuildInfo l')) ++ [fltkcdir]
+                                    extraLibDirs = (extraLibDirs (libBuildInfo l')) ++ [dir]
                                  }
                             }
                     )
@@ -267,12 +275,16 @@ myBuildHook pkg_descr local_bld_info user_hooks bld_flags = do
             Windows -> updateEnv "PATH" . windowsFriendlyPaths
             _ -> updateEnv "PATH"
      else return ()
-     let compileC = putStrLn "==Compiling C bindings==" >> runMake []
+     let compileC = do
+           putStrLn "==Compiling C bindings=="
+           runMake (buildDir local_bld_info) []
+
+     let fltkcdir = (buildDir local_bld_info) </> "c-lib"
      cdirexists <- doesDirectoryExist fltkcdir
      if cdirexists
        then
        do
-        clibraries <- getDirectoryContents fltkcdir
+        clibraries <- listDirectory fltkcdir
         when (null $ filter (Data.List.isInfixOf "fltkc") clibraries) compileC
        else compileC
      apiVersion <- getApiVersion
@@ -315,7 +327,7 @@ myBuildHook pkg_descr local_bld_info user_hooks bld_flags = do
                                      ld_incdirs
                  return (pkg_descr {library = fixedLib})
          in do
-           fixedPkgDescr <- rewritePaths apiVersionAddedPkgDescription >>= return . addFltkcDir
+           fixedPkgDescr <- rewritePaths apiVersionAddedPkgDescription >>= return . addFltkcDir fltkcdir
            buildHook autoconfUserHooks fixedPkgDescr local_bld_info user_hooks bld_flags
        Linux -> do
          updateEnv "LIBRARY_PATH" fltkcdir
@@ -327,6 +339,7 @@ myBuildHook pkg_descr local_bld_info user_hooks bld_flags = do
 
 copyCBindingsAndBundledExecutables :: PackageDescription -> LocalBuildInfo -> UserHooks -> CopyFlags -> IO ()
 copyCBindingsAndBundledExecutables pkg_descr lbi uhs flags = do
+    let fltkcdir = (buildDir lbi) </> "c-lib"
     (copyHook autoconfUserHooks) pkg_descr lbi uhs flags
     let installDirs = absoluteInstallDirs pkg_descr lbi
                       . fromFlag . copyDest
@@ -341,7 +354,7 @@ copyCBindingsAndBundledExecutables pkg_descr lbi uhs flags = do
          (fromFlag $ copyVerbosity flags)
           "cp"
           [
-            "c-lib" </> "libfltkc-dyn.dylib"
+            fltkcdir </> "libfltkc-dyn.dylib"
           , libPref
           ]
      _ -> do
@@ -349,15 +362,13 @@ copyCBindingsAndBundledExecutables pkg_descr lbi uhs flags = do
        rawSystemExit
          (fromFlag $ copyVerbosity flags) "cp"
          [
-           "c-lib" </> "libfltkc-dyn.so"
+           fltkcdir </> "libfltkc-dyn.so"
          , libPref
          ]
     if (bundledBuild (configFlags lbi))
     then do
       executableDir <- (bundlePrefix (configFlags lbi)) "bin"
-      projectRoot <- getCurrentDirectory
       let binPref = bindir installDirs
-      let fltkDir = projectRoot </>  fltkSource
       fluidExists <- doesFileExist (binPref </> "fluid")
       fltkConfigExists <- doesFileExist (binPref </> "fltk-config")
       if (not fluidExists)
